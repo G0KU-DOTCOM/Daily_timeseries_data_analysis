@@ -1,0 +1,939 @@
+---
+title: "Assignment 3"
+author:
+- Fabian Heflo
+- Agop Haroun
+output: 
+  html_document:
+    df_print: paged
+  pdf_document: 
+    latex_engine: xelatex
+---
+
+# Part 1
+
+## Task A
+
+```{r}
+library(dplyr)
+library(readr)
+library(lubridate)
+library(tidyverse)
+library(tidyr)
+library(ggplot2)
+library(imputeTS)
+?read.csv2()
+elhub <- read.csv2("consumption_per_group_aas_hour.csv")
+elhub <- elhub %>%
+  mutate(STARTTID = ymd_hms(STARTTID, tz = "Europe/Oslo"))
+```
+
+We find that the easiest way to handle the time zone was to mutate the STARTTID and setting the time zone to be in Europe, Oslo. Had a bit trouble with the locale argument.
+
+```{r}
+elhub <- elhub %>%
+  dplyr::select(STARTTID, FORBRUKSGRUPPE, VOLUM_KWH)
+```
+
+```{r}
+first_complete_row <- which(complete.cases(elhub))[1]
+elhub <- elhub[first_complete_row:nrow(elhub), ]
+```
+Trimmed the data to start from the first complete row.
+```{r}
+daily_data <- elhub %>%
+  mutate(date = floor_date(STARTTID, "day")) %>%
+  group_by(date, FORBRUKSGRUPPE) %>%
+  summarise(daily_kwh = sum(VOLUM_KWH, na.rm = TRUE))
+```
+
+```{r}
+# Dates for DST changes 
+dst_start <- ymd_hms("2021-03-28 02:00:00", tz = "Europe/Oslo")
+dst_end <- ymd_hms("2021-10-31 02:00:00", tz = "Europe/Oslo")
+
+dst_start_check <- elhub %>%
+  filter(STARTTID >= dst_start - hours(2) & STARTTID <= dst_start + hours(12))
+
+dst_end_check <- elhub %>%
+  filter(STARTTID >= dst_end - hours(1) & STARTTID <= dst_end + hours(1))
+
+print("DST Start Transition (March)")
+print(dst_start_check)
+
+print("DST End Transition (October)")
+print(dst_end_check)
+```
+
+```{r}
+dst_start_day_check <- elhub %>%
+  filter(STARTTID >= ymd_hms("2021-03-28 00:00") & STARTTID < ymd_hms("2021-03-29 00:00"))
+
+print("Entire Day Check for DST Start (March 28)")
+print(dst_start_day_check)
+```
+
+Data starts at 2021-04-01, which is obviously after the last Sunday in March. The last Sunday in October makes perfect sense, with duplicate times of 02:00 with different values.
+
+The last Sunday in March we move forward by one hour at 02.00, skipping the 02.00-02.59. This should leave us with a missing our on this day. 
+The last Sunday in October we move backwards by one hour, at 03.00, duplicating the hour 02.00-02.59. This should leave us with a duplicated hour in our data. 
+When using hourly data, this could increase the complexity of our analysis and the models sensitivity, but when we aggregate our hourly data into daily data, the impact of DST will be minimized. 
+
+## Task B
+
+```{r}
+library(readxl)
+
+load_and_process_file <- function(file_path) {
+  data <- read_excel(file_path)
+  
+  data <- data %>%
+  select(DATO, LT, GLOB) %>%
+  mutate(DATO = as.POSIXct(DATO))
+         
+  data$DATO <- floor_date(data$DATO, unit = "day")    
+  return(data)
+}
+```
+
+Comment: We had trouble understanding the connection between the dates (what we should do) and the assignment. Therefor we adjusted the dates to only contain the date without the hms.
+
+```{r}
+file_paths <- list.files(pattern = "Aas dogn .*\\.xlsx", full.names = TRUE)
+
+all_data <- do.call(rbind, lapply(file_paths, load_and_process_file))
+```
+
+```{r}
+# Define the range of dates you expect
+start_date <- as.Date("2017-01-01")
+end_date <- as.Date("2024-12-31")
+expected_dates <- seq.Date(start_date, end_date, by = "day")
+
+# Filter for leap year dates
+leap_year_dates <- expected_dates[month(expected_dates) == 2 & day(expected_dates) == 29]
+```
+Leap year adjustments ensure consistency across non-leap years, helping to avoid mismatches when modeling or analyzing yearly seasonal patterns.
+```{r}
+all_data <- all_data[order(all_data$DATO),]
+```
+
+```{r}
+na_count <- sapply(all_data, function(x) sum(is.na(x)))
+na_count
+```
+
+```{r}
+ggplot(all_data, aes(x = DATO, y = GLOB)) +
+  geom_line() +
+  labs(title = "Time Series of GLOB Values", x = "Date", y = "GLOB") +
+  theme_minimal()
+```
+
+```{r}
+all_data_imputed <- na_kalman(all_data, model = "auto.arima")
+```
+
+```{r}
+ggplot_na_imputations(all_data$GLOB, all_data_imputed)
+```
+
+We used imputeTS cheat sheet to help us find a imputation method. Kalman Smoothing respects the seasonality and trend which we figured to be important in our case. We tried some different methods but ended up with a nice looking imputation from the Kalman, and stuck whit that. The Kalman Smoothing is a dynamic model which adapts to changing patterns. It also separates signal from noise, improving accuracy.
+
+## Task C
+
+```{r}
+range_of_daily_data <- c(min(daily_data$date), max(daily_data$date))
+range_of_daily_data
+```
+
+```{r}
+range_of_all_data <- c(min(all_data$DATO), max(all_data$DATO))
+range_of_all_data
+```
+
+Merge the two datasets beginning in 2021-04-01 to 2024-09-30.
+
+```{r}
+daily_data_wide <- daily_data %>%
+  pivot_wider(names_from = FORBRUKSGRUPPE, values_from = daily_kwh)
+
+# date range (without time zone)
+start_date <- "2021-04-30"
+end_date <- "2024-09-30"
+
+# Filter all_data for the specified date range
+filtered_all_data <- all_data_imputed %>%
+  filter(DATO >= start_date & DATO <= end_date)
+
+# Filter daily_data_wide for the specified date range
+filtered_daily_data <- daily_data_wide %>%
+  filter(date >= start_date & date <= end_date)
+
+# Ensure both date columns are in Date class
+filtered_all_data <- filtered_all_data %>%
+  mutate(DATO = as.Date(DATO))
+
+filtered_daily_data <- filtered_daily_data %>%
+  mutate(date = as.Date(date))
+
+# Merge the filtered datasets on the specified date columns using full_join
+merged_data <- filtered_all_data %>%
+  full_join(filtered_daily_data, by = c("DATO" = "date"))
+head(merged_data)
+```
+
+```{r}
+# Filter out leap day (February 29)
+merged_data_no_leap <- merged_data %>%
+  filter(!(format(DATO, "%m-%d") == "02-29"))
+```
+
+```{r}
+missing_in_daily_data <- setdiff(filtered_all_data$DATO, filtered_daily_data$date)
+missing_in_all_data <- setdiff(filtered_daily_data$date, filtered_all_data$DATO)
+
+print(missing_in_daily_data)
+print(missing_in_all_data)
+```
+
+```{r}
+missing_in_daily_data <- as.Date(missing_in_daily_data, origin = "1970-01-01")
+missing_in_all_data <- as.Date(missing_in_all_data, origin = "1970-01-01")
+
+print(missing_in_daily_data)
+print(missing_in_all_data)
+```
+
+Had trouble with the previous dates used. 2021-04-05/2021-04-29 suddenly gave missing values for the daily_data part of the merged data. Changing the start date to 2021-04-30 to avoid trouble.
+
+```{r}
+merged_data_no_leap_imputed <- merged_data_no_leap %>%
+  mutate(across(c(GLOB, LT), ~ na_kalman(.)))
+```
+
+Imputed a few missing values.
+
+```{r}
+ggplot_na_distribution(merged_data_no_leap_imputed)
+```
+
+```{r}
+merged_data_no_leap_imputed <- merged_data_no_leap_imputed %>%
+  arrange(DATO) %>%       
+  distinct(DATO, .keep_all = TRUE)  
+```
+
+Arranged the correct order of dates, and removed duplicates.
+
+# Part 2
+
+## Task D
+
+```{r}
+library(ggplot2)
+library(tidyr)
+
+# Convert data to long format for easier plotting of multiple variables
+merged_data_long <- merged_data_no_leap_imputed %>%
+  pivot_longer(cols = c(Forretning, Industri, Privat), 
+               names_to = "Measurement", values_to = "Value")
+
+ggplot(merged_data_long, aes(x = DATO, y = Value, color = Measurement)) +
+  geom_line() +
+  labs(title = "Raw Data Visualization for Measurements",
+       x = "Date",
+       y = "Value") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+They all peak in the winter season, and are at its lowest in the summer season. Looks like it is possible to find a increasing trend in 'Privat', while the two other looks more stable.
+
+```{r}
+merged_data_long2 <- merged_data_no_leap_imputed %>%
+  pivot_longer(cols = c(LT, GLOB), 
+               names_to = "Measurement", values_to = "Value")
+
+ggplot(merged_data_long2, aes(x = DATO, y = Value, color = Measurement)) +
+  geom_line() +
+  labs(title = "Raw Data Visualization for Measurements",
+       x = "Date",
+       y = "Value") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+We find seasonality in this plot as well, with a opposite seasonality where it is at its lowest in the winter and highest in the summer season. The air temperature (LT) seems to get lower each year, and in the previous plot, we could see that the private usage of electricity increased each year; we might have a strong correlation here. The global radiation (GLOB) looks stable and we see that we have the most radiation in the summer season.
+
+```{r}
+min_max_scale <- function(x) {
+  (x - min(x, na.rm = TRUE)) / (max(x, na.rm = TRUE) - min(x, na.rm = TRUE))
+}
+
+# min-max scaling
+merged_data_long <- merged_data_no_leap_imputed %>%
+  pivot_longer(cols = c(LT, GLOB, Forretning, Industri, Privat),
+               names_to = "Measurement", values_to = "Value") %>%
+  group_by(Measurement) %>%
+  mutate(Value_scaled = min_max_scale(Value))
+
+ggplot(merged_data_long, aes(x = DATO, y = Value_scaled, color = Measurement)) +
+  geom_line() +
+  labs(title = "Scaled Data Visualization for Measurements",
+       x = "Date", y = "Scaled Value (0-1)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+The data scaled between 0 and 1. Notice the crossing of seasonal trends.
+
+```{r}
+duplicates_in_data <- merged_data_no_leap_imputed %>%
+  filter(duplicated(DATO) | duplicated(DATO, fromLast = TRUE))
+print(duplicates_in_data)
+```
+
+2024-03-18 and 2024-04-02 have duplicates.
+
+```{r}
+merged_data_clean <- merged_data_no_leap_imputed %>%
+  distinct(DATO, .keep_all = TRUE)
+```
+
+```{r}
+library(feasts)
+library(tsibble)
+
+merged_tsibble <- merged_data_clean %>%
+  as_tsibble(index = DATO)
+```
+
+In the KPSS test, p-value over 0.05 indicates stationarity and if its under 0.05, it indicates non-stationarity. 
+```{r}
+# KPSS on GLOB
+kpss_result_glob <- merged_tsibble %>%
+  features(GLOB, unitroot_kpss)
+print("KPSS Test for GLOB:")
+print(kpss_result_glob)
+```
+
+p-value ≥ 0.05 -\> indicating stationarity for GLOB.
+
+```{r}
+# KPSS on LT
+kpss_result_lt <- merged_tsibble %>%
+  features(LT, unitroot_kpss)
+print("KPSS Test for LT:")
+print(kpss_result_lt)
+```
+
+p-value \< 0.05 -\> indicating non-stationarity for LT.
+
+```{r}
+# KPSS on Forretning 
+kpss_result_forretning <- merged_tsibble %>%
+  features(Forretning, unitroot_kpss)
+print("KPSS Test for Forretning:")
+print(kpss_result_forretning)
+```
+
+p-value \< 0.05 -\> indicating non-stationarity for Forretning.
+
+```{r}
+# KPSS on Industri
+kpss_result_industri <- merged_tsibble %>%
+  features(Industri, unitroot_kpss)
+print("KPSS Test for Industri:")
+print(kpss_result_industri)
+```
+
+p-value \< 0.05 -\> indicating non-stationarity for Industri.
+
+```{r}
+# KPSS on Privat 
+kpss_result_privat <- merged_tsibble %>%
+  features(Privat, unitroot_kpss)
+print("KPSS Test for Privat:")
+print(kpss_result_privat)
+```
+
+p-value \< 0.05 -\> indicating non-stationarity for Privat.
+
+```{r}
+which(is.na(merged_data_clean))
+merged_data_clean[which(is.na(merged_data_clean)), ]
+merged_data_clean <- merged_data_clean %>% na.omit()
+```
+
+```{r}
+# function to calculate max cross-correlation for each pair
+cross_correlation_matrix <- function(data) {
+  variable_names <- colnames(data)
+  results <- expand.grid(var1 = variable_names, var2 = variable_names)
+  results <- results %>% filter(var1 != var2)
+
+  results <- results %>%
+    rowwise() %>%
+    mutate(
+      max_ccf = max(abs(ccf(data[[var1]], data[[var2]], plot = FALSE)$acf), na.rm = TRUE),
+      max_lag = which.max(abs(ccf(data[[var1]], data[[var2]], plot = FALSE)$acf)) - 1
+    )
+
+  return(results)
+}
+merged_data_values <- merged_data_clean %>%
+  select(-DATO)
+ccf_results <- cross_correlation_matrix(merged_data_values)
+print(ccf_results)
+```
+
+```{r}
+ggplot(ccf_results, aes(x = var1, y = var2, fill = max_ccf)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0.5) +
+  labs(title = "Cross-Correlation Between Variables",
+       x = "", y = "", fill = "Max CCF") +
+  theme_minimal()
+```
+
+From this cross-correlation, the assumption that Privat and LT would have a strong correlation hold to be true. Forretning and Industri also have a strong correlation. GLOB have low correlation with all the variables.
+
+```{r}
+plot_acf_pacf_short <- function(data, column_name) {
+  cat("Plotting ACF and PACF for", column_name, "short-term (14 days)\n")
+  acf(data[[column_name]], lag.max = 14, main = paste("ACF of", column_name, "(Short-term)"))
+  pacf(data[[column_name]], lag.max = 14, main = paste("PACF of", column_name, "(Short-term)"))
+}
+
+plot_acf_pacf_long <- function(data, column_name) {
+  cat("Plotting ACF and PACF for", column_name, "long-term (2 years)\n")
+  acf(data[[column_name]], lag.max = 730, main = paste("ACF of", column_name, "(Long-term)"))
+  pacf(data[[column_name]], lag.max = 730, main = paste("PACF of", column_name, "(Long-term)"))
+}
+columns_to_analyze <- c("GLOB", "LT", "Forretning", "Industri", "Privat")
+for (col in columns_to_analyze) {
+  plot_acf_pacf_short(merged_data_clean, col)
+  plot_acf_pacf_long(merged_data_clean, col)
+}
+```
+#### GLOB:
+
+When we look at the short term ACF, it decays slowly which suggests non-stationarity; indicating a trend of seasonality in the data. All the bars are above the blue confidence interval lines, which suggest that the the series GLOB has strong autocorrelation in the short term. The PACF has little to no significant correlation after accounting for the high correlation in the first lag. After lag 7, all the partial autocorrelation values stays close to the blue lines. Since it has a drop-off after lag 1, we can assume that the series can be modeled as an autoregressive process of order 1. This PACF plot shows an decay in the correlation, and could suggest that the series is stationary, opposing the ACF plot (both for short term).
+
+In the long term ACF, the sinusoidal shape suggests that series show a strong seasonal component. From the PACF again supports AR(1) model, and the decays of autocorrelation and the fact that most of the bars are between the blue lines with a few exceptions, could indicate stationarity. The KPSS done above showed a p-value ≥ 0.05 which indicates stationarity for GLOB.
+
+#### LT:
+
+The ACF of LT resembles that of GLOB, showing a slow decay. This slow decay suggests non-stationarity in the data, meaning that the lags are highly correlated with their preceding values in the short term. The LT variable has a strong short term dependency on it immediate past value which is visible in the PACF plot. Beyond lag 1, it does not exhibit any strong dependencies, only a few outside of the confidence interval. Here we could assume some stationarity in the data.
+
+From the long term plot of ACF, the sinusoidal shape, as we also had for GLOB, suggest a strong seasonal component. The PACF decays fast and the bars mostly stays inside the confidence interval, which could lead us to this that the LT series is stationary. The KPSS tells us otherwise; it gave an p-value \< 0.05, which indicates non-stationarity for LT. This mismatch could have something to do with a trend and seasonal components. From the plot of the LT series above, there was a slight decay each year in the winter season, which could strengthen out thoughts of a trend.
+
+#### Forretning:
+
+ACF plot suggest that Forretning series has both short term correlation with recent values and a periodic component. The plot decays a bit but rises fast again and repeats. This could indicate the periodicity. Since the ACF does not quickly drop down to zero, it suggest non-stationarity. It also looks like the period the ACF caches is weekly, since the autocorrelation is at it highest every 7th day. In the PACF lag 1, 3, 5, 6, 7 and 8 looks to be influenced by values a few days back.
+
+In the long term the ACF plot shows cyclical behavior with the same sinusoidal pattern as the previous variables. It also decays slowly which is typical for non-stationary series, and the KPSS also suggested non-stationarity. The small spikes in the pattern could be noise or some irregular pattern, or some what more complex seasonality; possible monthly or weekly seasonality. PACF show significant partial autocorrelation in the short term with its initial lags. Past these initial lags, where it dampens, all the lags stays within the confidence interval. Could have some stationarity but the KPSS tells us otherwise.
+
+#### Industri:
+
+The ACF and PACF in the short term for Industri, resembles the plots for Forretning. In the cross-correlation matrix, these two variables had a very high correlation at around 0.96. For the long term it is also very close to Forretning.
+
+#### Privat:
+
+ACF of Privat is bit different from the two previous. The lags decays really slow and show high dependence from the previous days for the short term. The PACF has a strong initial lag, indicating that the immediate previous value has strong influence on the current value. Beyond lag 1, the lags have small partial autocorrelation, mostly inside the confidence interval, with a few right on the outside.
+
+In the long term, the ACF shows the same sinusoidal pattern as the other variables. In contrast to the spikes that clearly showed in Forretning and Industri, this plot seems to more smooth. This could indicate that there only on seasonal component. It is also decaying suggesting non-stationarity. The PACF has on initial strong lag, and the drops quickly, keeping most of the lags within the confidence interval. The KPSS suggested non-stationarity, even though we might find some stationarity from the PACF, but not from the ACF.
+
+## Task E
+
+```{r}
+seasonally_differenced_data <- merged_tsibble %>%
+  mutate(across(c(GLOB, LT, Forretning, Industri, Privat),
+                ~ difference(.x, lag = 365))) %>%
+  filter(!is.na(rowSums(across(c(GLOB, LT, Forretning, Industri, Privat)))))
+```
+
+```{r}
+for (col in columns_to_analyze) {
+  plot_acf_pacf_short(seasonally_differenced_data, col)
+  plot_acf_pacf_long(seasonally_differenced_data, col)
+}
+```
+
+### Discussion and Comparison of the Correlation Analysis
+
+#### GLOB:
+
+The bars in the ACF plot of GLOB decays quickly and stays between the blue confidence interval lines. This indicates a short term correlation with the immediate preceding values. Compared to the original data, this seems to be more stationary in the short term, and less correlated after a few lags. The PACF drops a bit faster after the differencing, and stays withing the confidence interval, suggesting stationarity. For the long term, the lag gives high correlation as expected from all the previous plots done in this analyze. Theirs a few lags outside of the confidence interval in the beginning, and also around lag 365, which would be a year. This tells us that the GLOB values are somewhat correlated with the values one year back. In comparison to the original data, we do not have the same seasonal component present with the sinusoidal pattern. The PACF gives quite resembled result as of what the ACF gave.
+
+#### LT:
+
+In the ACF plot of LT over the short term, it decays smoothly an approaches zero around lag 10-11. In the original data, it decayed much slower. The PACF also seem to drop further down to zero at most lags, still having a strong correlation on 1 lag. In the long term we don't have the same sinusoidal pattern we had before differencing. A few lags in the beginning which is highly autocorrelated, and a few around a year. There is also some bars outside of the confidence interval just after 100 lags. These could be explained by the seasonal differences temperature. The PACF drops down to around zero right away and seems to be mostly steady within the confidence interval. The plot suggest stationarity.
+
+#### Forretning:
+
+The first bar in the ACF is close to one, and the next two. highest bars is at lag 7 and 14. This could indicate a weekly period of high autocorrelation. Lag 8 stands out in both this PACF plot and that for the original data. Could be some seasonal component. For the long term, it looks like a dampened seasonal pattern in the ACF plot. It should probably be difference more. The PACF have a few long bars in the beginning both positive and negative, before it quickly drops down within the confidence interval. There is some resemblances between the long term plots for Forretning before and after differencing. The ACF plot exhibits more stationarity now than what it did, even though it still looks to be non-stationary.
+
+#### Industri:
+
+The ACF and PACF for Industri is almost identical to the ones for Forretning with the same lags standing out. For the long term ACF, there not as much of a seasonal pattern as was exhibited in Forretning, but there is still a clear resemblance. PACF is aslo quite close to Forretnings PACF.
+
+#### Privat:
+
+Instead of having almost no decay, this time the ACF plot of Privat gives a slow but decaying ACF plot. In short term, it clearly seems to be non-stationary. ACF long term looks to have some seasonal pattern. The PACF looks good, mostly staying within the confidence interval after the first lag with high partial autocorrelation.
+
+Overall, the last three variables could use one more differencing.
+
+## Task F
+
+Was struggling with the stl. We forgot to think of the frequency.
+
+```{r}
+convert_to_ts <- function(data, start_year = 2021, start_day = 1, frequency = 365) {
+  # Ensure `data` is a data.frame
+  data <- as.data.frame(data)
+  
+  # Initialize an empty list to store time series columns
+  ts_list <- list()
+  
+  # Loop over each column in the data frame
+  for (col_name in names(data)) {
+    # Check if the column is numeric (to be converted to time series)
+    if (is.numeric(data[[col_name]])) {
+      # Convert column to time series with specified frequency
+      ts_list[[col_name]] <- ts(data[[col_name]], 
+                                frequency = frequency, 
+                                start = c(start_year, start_day))
+    } else {
+      # If not numeric, keep the column as it is (e.g., Date column)
+      ts_list[[col_name]] <- data[[col_name]]
+    }
+  }
+  
+  # Convert the list to a data frame
+  ts_data <- as.data.frame(ts_list)
+  
+  # Return the data frame with time series columns
+  return(ts_data)
+}
+merged_data_ts <- convert_to_ts(merged_data_clean)
+```
+
+```{r}
+perform_stl_on_all_columns <- function(data, date_column = "DATO", frequency = 365) {
+  # Ensure `data` is a data.frame
+  data <- as.data.frame(data)
+  
+  # Initialize an empty list to store STL decomposition results
+  stl_results <- list()
+  
+  # Loop over each column in the data frame
+  for (col_name in names(data)) {
+    # Skip the date column
+    if (col_name != date_column && is.numeric(data[[col_name]])) {
+      # Convert the column to a time series with the specified frequency
+      ts_column <- ts(data[[col_name]], frequency = frequency)
+      
+      # Perform STL decomposition on the time series column
+      stl_result <- stl(ts_column, s.window = "periodic")
+      
+      # Store the result in the list with the column name as key
+      stl_results[[col_name]] <- stl_result
+    }
+  }
+  
+  # Return the list of STL decomposition results
+  return(stl_results)
+}
+
+stl_decompositions <- perform_stl_on_all_columns(merged_data_clean)
+```
+"periodic" is ideal for capturing annual seasonality due to the consistent cycle length.
+```{r}
+# Define a function to plot and extract STL components for each column in stl_decompositions
+plot_and_extract_stl_components <- function(stl_decompositions) {
+  components <- list()
+  # Loop through each decomposition in the list
+  for (col_name in names(stl_decompositions)) {
+    
+    # Access the STL decomposition for the specific column
+    stl_result <- stl_decompositions[[col_name]]
+    
+    # Plot the decomposition
+    cat("Plotting STL decomposition for:", col_name, "\n")
+    plot(stl_result, main = paste("STL Decomposition for", col_name))
+    
+    # Extract individual components
+    seasonal_component <- stl_result$time.series[, "seasonal"]
+    trend_component <- stl_result$time.series[, "trend"]
+    remainder_component <- stl_result$time.series[, "remainder"]
+    
+    components[[col_name]] <- list(seasonal = seasonal_component,
+                                    trend = trend_component,
+                                    remainder = remainder_component)
+  }
+  return(components)
+}
+
+list_comps <- plot_and_extract_stl_components(stl_decompositions)
+```
+
+```{r}
+# Initialize empty lists to store each component for all variables
+seasonal_data <- list()
+trend_remainder_data <- list()
+
+# Loop over each variable in list_comps
+for (var_name in names(list_comps)) {
+  # Extract the components for the current variable
+  seasonal_component <- list_comps[[var_name]]$seasonal
+  trend_component <- list_comps[[var_name]]$trend
+  remainder_component <- list_comps[[var_name]]$remainder
+  
+  # Store the seasonal component in the seasonal_data list
+  seasonal_data[[var_name]] <- seasonal_component
+  
+  # Store the sum of trend and remainder in the trend_remainder_data list
+  trend_remainder_data[[var_name]] <- trend_component + remainder_component
+}
+
+# Convert the lists to data frames
+seasonal_df <- as.data.frame(seasonal_data)
+trend_remainder_df <- as.data.frame(trend_remainder_data)
+
+# Add row names as Date if available (assuming the same length and that you have dates)
+# If you have a separate vector of dates, you can add it as a Date column.
+dates <- merged_data_ts$DATO # Uncomment and define your dates if needed
+seasonal_df$Date <- dates
+trend_remainder_df$Date <- dates
+
+# Print or check the data frames
+head(seasonal_df)
+head(trend_remainder_df)
+```
+
+## Task G
+
+### Granger Causality Test
+
+Null Hypothesis (H0): X does not Granger-cause Y, meaning past values of X do not provide additional predictive information for Y over Y’s own past values. 
+
+Alternative Hypothesis (H1): X Granger-causes Y, indicating past values of X help improve predictions of Y beyond using only Y’s own past values.
+
+An example of Granger: we can't define that the weather is hot because of an ice cream sale, but we can define ice cream sale because of the weather is hot.
+
+
+The Granger causality test is performed by comparing two types of models: a restricted model (using only the target variable's past values) and an unrestricted model (including both the target and predictor variable's past values). These models rely on autoregressive (AR) and vector autoregressive (VAR) frameworks.
+
+Autoregressive (AR) Models: For a single time series, AR models use past values to predict the current value.
+
+Vector Autoregressive (VAR) Models: For multiple time series, VAR models consider past values of each time series in the system to predict current values of each series.
+
+
+```{r}
+ts_trend_reminder <- as_tsibble(trend_remainder_df)
+
+deseasoned_data_ts <- ts(trend_remainder_df, frequency = 365)
+original_data_ts <- ts(merged_tsibble, frequency = 365)
+```
+
+```{r}
+library(vars)
+# For original data
+lag_selection_orig <- VARselect(original_data_ts, lag.max = 15, type = "const")
+lag_order_orig <- lag_selection_orig$selection["AIC(n)"] 
+
+# For deseasoned data
+lag_selection_deseason <- VARselect(deseasoned_data_ts, lag.max = 15, type = "const")
+lag_order_deseason <- lag_selection_deseason$selection["AIC(n)"]
+```
+
+```{r}
+var_model_orig <- VAR(original_data_ts, p = lag_order_orig, type = "const")
+var_model_deseason <- VAR(deseasoned_data_ts, p = lag_order_deseason, type = "const")
+```
+
+```{r}
+# LT
+granger_test_orig <- causality(var_model_orig, cause = "LT") 
+print(granger_test_orig)
+granger_test_deseason <- causality(var_model_deseason, cause = "LT") 
+print(granger_test_deseason)
+```
+Granger causality H0: LT do not Granger-cause GLOB Forretning Industri Privat.
+Original Data: 
+p-value << 0.05, and we reject the H0. This indicates that past values of LT provide significant information that helps predict the other variables. 
+Deseasoned Data: 
+p-value << 0.05, and we reject the H0. This indicates that past values of LT provide significant information that helps predict the other variables. 
+
+```{r}
+# GLOB
+granger_test_orig <- causality(var_model_orig, cause = "GLOB") 
+print(granger_test_orig)
+granger_test_deseason <- causality(var_model_deseason, cause = "GLOB") 
+print(granger_test_deseason)
+```
+Granger causality H0: GLOB do not Granger-cause LT Forretning Industri Privat.
+Original Data: 
+p-value << 0.05, and we reject the H0. This indicates that past values of GLOB provide significant information that helps predict the other variables. 
+Deseasoned Data: 
+p-value < 0.05, and we reject the H0. This indicates that past values of GLOB provide significant information that helps predict the other variables. 
+
+```{r}
+# Forretning 
+granger_test_orig <- causality(var_model_orig, cause = "Forretning") 
+print(granger_test_orig)
+granger_test_deseason <- causality(var_model_deseason, cause = "Forretning") 
+print(granger_test_deseason)
+```
+Granger causality H0: Forretning do not Granger-cause LT GLOB Industri Privat.
+Original Data: 
+p-value << 0.05, and we reject the H0. This indicates that past values of Forretning provide significant information that helps predict the other variables. 
+Deseasoned Data: 
+p-value << 0.05, and we reject the H0. This indicates that past values of Forretning provide significant information that helps predict the other variables. 
+
+```{r}
+# Industri 
+granger_test_orig <- causality(var_model_orig, cause = "Industri") 
+print(granger_test_orig)
+granger_test_deseason <- causality(var_model_deseason, cause = "Industri") 
+print(granger_test_deseason)
+```
+Granger causality H0: Industri do not Granger-cause LT GLOB Forretning Privat.
+Original Data: 
+p-value << 0.05, and we reject the H0. This indicates that past values of Industri provide significant information that helps predict the other variables. 
+Deseasoned Data: 
+p-value << 0.05, and we reject the H0. This indicates that past values of Industri provide significant information that helps predict the other variables. 
+
+```{r}
+# Privat
+granger_test_orig <- causality(var_model_orig, cause = "Privat") 
+print(granger_test_orig)
+granger_test_deseason <- causality(var_model_deseason, cause = "Privat") 
+print(granger_test_deseason)
+```
+Granger causality H0: Privat do not Granger-cause LT GLOB Forretning Industri.
+Original Data: 
+p-value << 0.05, and we reject the H0. This indicates that past values of Privat provide significant information that helps predict the other variables. 
+Deseasoned Data: 
+p-value << 0.05, and we reject the H0. This indicates that past values of Privat provide significant information that helps predict the other variables. 
+
+The consistency of result between the original and deseasoned data suggest that the predictive relationship is not only due to seasonal components, assuming the deseasoning has been done correctly.
+
+We can not conclude that Granger causality implies causality. The Granger causality test if one variable can improve the prediction of another based on previous values, backshifting. This doesn't directly mean that one variable causes changes in the other. It doesn't either take in count any potential third factors that may influence both variables. What we might say is that the Granger causality suggests a predictive relationship, predictive causation but not true causation. 
+
+## Task H
+
+```{r}
+library(forecast)
+rmse <- function(predicted, actual) {
+  sqrt(mean((predicted - actual)^2))
+}
+# Function given in the assignment description
+CV.2 <- function(data, model_fct, init_fold = 1096 - 90 * 5, h = 90, return_models = FALSE, ...) {
+  
+  fold_inds <- seq(init_fold, length(data) - h, by = h)
+  rmse <- c()
+  models <- list()
+  
+  for (i in seq_along(fold_inds)) {
+    
+    fold <- fold_inds[i]
+    
+    train <- data[1:(fold - 1)]
+    test <- data[fold:(fold + h - 1)] 
+    
+    new_model <- model_fct(train, ...)
+    models[[i]] <- new_model
+    forecast <- forecast(new_model, h = h)
+    rmse <- c(rmse, rmse(forecast$mean, test))
+  }
+  
+  if (return_models) {
+    return(list(rmse = rmse, model = models)) 
+  } else {
+    return(rmse)
+  }
+}
+```
+```{r}
+forecast_Privat <- CV.2(merged_data_ts$Privat, model_fct = auto.arima, return_models = TRUE)
+print(forecast_Privat)
+```
+```{r}
+forecast_LT <- CV.2(merged_data_ts$LT, model_fct = auto.arima, return_models = TRUE)
+print(forecast_LT)
+```
+```{r}
+forecast_GLOB <- CV.2(merged_data_ts$GLOB, model_fct = auto.arima, return_models = TRUE)
+print(forecast_GLOB)
+```
+
+```{r}
+rmse_results <- data.frame(
+  Variable = c("LT", "GLOB"),
+  RMSE = c(mean(forecast_LT$rmse), mean(forecast_GLOB$rmse))
+)
+
+ggplot(rmse_results, aes(x = Variable, y = RMSE)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  labs(title = "Average RMSE for LT and GLOB", y = "Average RMSE", x = "Variable")
+```
+
+```{r}
+rmse_resultsP <- data.frame(
+  Variable = c("Privat"),
+  RMSE = c(mean(forecast_Privat$rmse))
+)
+
+ggplot(rmse_resultsP, aes(x = Variable, y = RMSE)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  labs(title = "Average RMSE for Privat", y = "Average RMSE", x = "")
+```
+The RMSE values for "Privat" are significantly higher compared to "GLOB" and "LT." This large discrepancy in scale comes from the huge difference in the scaling of the data itself.
+
+#### Discuss the limitation of forecasting on datasets with two years of data when there is a yearly seasonal period: 
+
+With just two years of data, there are only two full cycles of the yearly seasonality. This is generally insufficient to capture the variability of seasonal patterns over time. For instance, weather, electricity consumption, or other factors with annual seasonality can be influenced by broader, multi-year cycles or irregularities that may not be visible in such a short dataset. And in many time series, long-term trends coexist with seasonal patterns. However, identifying and separating these trends reliably from the seasonality is challenging with only two years of data. This can lead to inaccurate forecasts.
+
+```{r}
+all_data_imputed$DATO <- as.Date(all_data_imputed$DATO)
+
+# Convert the data to time series format
+lt_ts <- ts(all_data_imputed$LT, start = c(2017, 1), frequency = 365)    # Daily data for LT
+glob_ts <- ts(all_data_imputed$GLOB, start = c(2017, 1), frequency = 365)  # Daily data for GLOB
+
+# Forecast LT (Air Temperature)
+lt_model <- auto.arima(lt_ts)
+lt_forecast <- forecast(lt_model, h = 365)  # Forecast for the next year (365 days)
+
+# Forecast GLOB (Global Irradiation)
+glob_model <- auto.arima(glob_ts)
+glob_forecast <- forecast(glob_model, h = 365)  # Forecast for the next year (365 days)
+
+autoplot(lt_forecast) + 
+  labs(title = "Forecast of Air Temperature (LT) for the Next Year",
+       x = "Date", y = "Air Temperature (LT)")
+
+autoplot(glob_forecast) + 
+  labs(title = "Forecast of Global Irradiation (GLOB) for the Next Year",
+       x = "Date", y = "Global Irradiation (GLOB)")
+```
+
+#### Briefly explain the difference between using cross-validation on time series data and non-time series data:
+
+In cross-validation for non-time series data, data is randomly split into folds because observations are independent. In contrast, for time series data, cross-validation must respect the temporal order, ensuring that training is done on past data to predict future data, as future values cannot be used for training. This prevents data leakage and maintains the temporal dependency in the model.
+
+```{r}
+lt_residuals <- residuals(lt_model)
+shapiro_lt <- shapiro.test(lt_residuals)
+print(shapiro_lt)
+plot(lt_residuals)
+```
+The residuals from our ARIMA model show significant non-normality (as indicated by the Shapiro-Wilk test) and some large spikes, suggesting potential outliers. While the variance seems fairly stable over time, the model may not fully capture all patterns in the data, possibly missing seasonal or autocorrelated components.4
+
+```{r}
+glob_residuals <- residuals(glob_model)
+shapiro_glob <- shapiro.test(glob_residuals)
+print(shapiro_glob)
+plot(glob_residuals)
+```
+The residual plot shows a recurring pattern with varying amplitudes over time, suggesting seasonality or structural shifts in the data. This pattern could also indicate that the model is not fully capturing the underlying seasonality or other cyclic behavior in the data.
+
+
+# Part 3
+## Task I
+```{r}
+library(forecast)
+library(ggplot2)
+
+# Convert data to time series format
+lt_ts <- ts(all_data_imputed$LT, start = c(2017, 1), frequency = 365)    # Daily data for LT (Air Temperature)
+glob_ts <- ts(all_data_imputed$GLOB, start = c(2017, 1), frequency = 365)  # Daily data for GLOB (Global Irradiation)
+
+# Fit an ARIMAX model to forecast GLOB using LT as an exogenous variable
+glob_arimax_model <- auto.arima(glob_ts, xreg = lt_ts)
+
+# Summarize the ARIMAX model for GLOB
+summary(glob_arimax_model)
+
+# Forecast for the next 365 days using the ARIMAX model for GLOB
+lt_forecast <- forecast(auto.arima(lt_ts), h = 365)  # Forecast future LT values
+future_lt <- lt_forecast$mean  # Forecasted LT values to use as exogenous input
+
+# Perform ARIMAX forecast on GLOB with future LT values
+glob_forecast_arimax <- forecast(glob_arimax_model, xreg = future_lt, h = 365)
+
+# Plot the ARIMAX forecast for GLOB
+autoplot(glob_forecast_arimax) +
+  labs(title = "ARIMAX Forecast of Global Irradiation (GLOB) using Air Temperature (LT) as Exogenous Variable",
+       x = "Date", y = "Global Irradiation (GLOB)")
+
+# Fit an ARIMAX model to forecast LT using GLOB as an exogenous variable
+lt_arimax_model <- auto.arima(lt_ts, xreg = glob_ts)
+
+# Summarize the ARIMAX model for LT
+summary(lt_arimax_model)
+
+# Forecast for the next 365 days using the ARIMAX model for LT
+glob_forecast <- forecast(auto.arima(glob_ts), h = 365)  # Forecast future GLOB values
+future_glob <- glob_forecast$mean  # Forecasted GLOB values to use as exogenous input
+
+# Perform ARIMAX forecast on LT with future GLOB values
+lt_forecast_arimax <- forecast(lt_arimax_model, xreg = future_glob, h = 365)
+
+# Plot the ARIMAX forecast for LT
+autoplot(lt_forecast_arimax) +
+  labs(title = "ARIMAX Forecast of Air Temperature (LT) using Global Irradiation (GLOB) as Exogenous Variable",
+       x = "Date", y = "Air Temperature (LT)")
+```
+
+### Detrended Arimax Using LT as Exogenous Variable
+```{r}
+# Detrend LT data using STL decomposition
+lt_ts_detrended <- stl(lt_ts, s.window = "periodic")$time.series[, 2]
+
+# Fit ARIMAX model with detrended LT as exogenous variable
+glob_arimax_model_detrended <- auto.arima(glob_ts, xreg = lt_ts_detrended)
+
+# Forecast for the next 365 days using the ARIMAX model
+# 
+lt_forecast_detrended <- forecast(auto.arima(lt_ts), h = 365)  # Forecast future LT
+future_lt_detrended <- lt_forecast_detrended$mean  # Extract forecasted LT values
+
+# Forecast GLOB using the forecasted future LT values
+glob_forecast_arimax_detrended <- forecast(glob_arimax_model_detrended, xreg = future_lt_detrended, h = 365)
+
+autoplot(glob_forecast_arimax_detrended) +
+  labs(title = "ARIMAX Forecast of Global Irradiation (GLOB) using Detrended Air Temperature (LT) as Exogenous Variable",
+       x = "Date", y = "Global Irradiation (GLOB)")
+```
+detrended arimax for both?
+```{r}
+lt_ts_detrended <- stl(lt_ts, s.window = "periodic")$time.series[, 2]
+
+glob_arimax_model_detrended <- auto.arima(glob_ts, xreg = lt_ts_detrended)
+
+lt_forecast_detrended <- forecast(auto.arima(lt_ts), h = 365)  
+future_lt_detrended <- lt_forecast_detrended$mean  
+
+glob_forecast_arimax_detrended <- forecast(glob_arimax_model_detrended, xreg = future_lt_detrended, h = 365)
+
+lt_forecast_plot <- autoplot(lt_forecast_detrended) +
+  labs(title = "Forecast of Air Temperature (LT)",
+       x = "Date", y = "Air Temperature (LT)")
+
+glob_forecast_plot <- autoplot(glob_forecast_arimax_detrended) +
+  labs(title = "ARIMAX Forecast of Global Irradiation (GLOB) using Detrended Air Temperature (LT) as Exogenous Variable",
+       x = "Date", y = "Global Irradiation (GLOB)")
+
+library(gridExtra)
+grid.arrange(lt_forecast_plot, glob_forecast_plot, ncol = 2)
+```
+Using exogenous variables like air temperature (LT) in an ARIMAX model can enhance forecasting by capturing the influence of external factors on the target variable, such as global irradiation (GLOB). This helps model the relationship between variables, leading to more accurate predictions. However, it introduces complexity, as too many regressors can lead to overfitting, and the quality of external data is crucial for model performance. Additionally, ARIMAX assumes linear relationships, which may not always hold.
+
+Detrending the data, such as through STL decomposition, removes long-term trends and isolates seasonal and cyclical behavior, making the data more stationary and easier to forecast. This can improve the model by focusing on short-term fluctuations. However, detrending may also obscure important long-term trends, especially if these trends are critical for the forecast. Moreover, incorrect detrending or over-differencing can distort the data, leading to poor model performance.
+
